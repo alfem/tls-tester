@@ -1,0 +1,1393 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+tls-tester — TLS/MTLS Diagnostic Server (Python 2.7 / 3.x)
+===========================================================
+Simula una aplicacion que escucha con HTTPS/MTLS (o HTTP simple) y vuelca
+toda la informacion de diagnostico sobre cada peticion: datos TLS,
+certificado de cliente, cabeceras HTTP, variables de entorno, etc.
+
+Compatible con Python 2.7 y Python 3.6+.
+
+Uso:
+  python tls-tester --port 8443
+  python tls-tester --port 8443 --cert server.pem --key server.key --ca-cert ca.pem
+  python tls-tester --port 8443 --no-mtls
+  python tls-tester --port 8443 --http                # modo HTTP sin TLS
+  python tls-tester --port 8443 --ca-cert ca.pem --output-dir ./logs
+
+Requisitos minimos: Python 2.7.9+ o Python 3.6+
+                    (para getpeercert(binary_form=True) y SSLContext)
+"""
+
+from __future__ import print_function
+
+import sys
+import os
+
+# ---------------------------------------------------------------------------
+# Capa de compatibilidad Python 2 / Python 3
+# ---------------------------------------------------------------------------
+
+PY2 = sys.version_info[0] == 2
+PY3 = sys.version_info[0] >= 3
+
+if PY3:
+    import http.server as BaseHTTPServer
+    import socketserver as SocketServer
+    import urllib.parse as urlparse
+    STRING_TYPES = (str,)
+    INTEGER_TYPES = (int,)
+else:
+    import BaseHTTPServer
+    import SocketServer
+    import urlparse
+    STRING_TYPES = (str, unicode)
+    INTEGER_TYPES = (int, long)
+
+import argparse
+import ssl
+import socket
+import json
+import datetime
+import hashlib
+import tempfile
+import subprocess
+import textwrap
+import binascii
+import atexit
+import shutil
+import base64
+
+# ---------------------------------------------------------------------------
+# Constantes — variables de entorno relevantes para MTLS / Java
+# ---------------------------------------------------------------------------
+
+RELEVANT_ENV_PREFIXES = [
+    'JAVA_',
+    'SSL_',
+    'HTTPS_',
+    'KEYSTORE_',
+    'TRUSTSTORE_',
+    'javax.net.ssl.',
+    'TLS_',
+    'CERT_',
+    'OPENSSL_',
+]
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+def to_bytes(s):
+    """Convierte str/unicode a bytes de forma compatible con Py2 y Py3."""
+    if isinstance(s, bytes):
+        return s
+    return s.encode('utf-8')
+
+
+def to_str(s):
+    """Convierte bytes/unicode a str nativo de forma compatible."""
+    if isinstance(s, str) and not isinstance(s, bytes):
+        return s
+    if isinstance(s, bytes):
+        return s.decode('utf-8', errors='replace')
+    return str(s) if PY3 else unicode(s)
+
+
+def b64encode(data):
+    """Codifica bytes a base64 (string) compatible Py2/Py3."""
+    raw = base64.b64encode(data)
+    if PY3:
+        return raw.decode('ascii')
+    return raw
+
+
+def is_text(data):
+    """Detecta si un buffer es texto imprimible o binario."""
+    if not data:
+        return True
+    # Si mas del 5% son bytes no imprimibles, lo consideramos binario
+    non_printable = sum(1 for b in bytearray(data) if b < 0x20 and b not in (0x09, 0x0A, 0x0D))
+    return non_printable <= len(data) * 0.05
+
+
+def hex_dump(data, width=16):
+    """Devuelve un hexdump al estilo xxd."""
+    lines = []
+    for i in range(0, len(data), width):
+        chunk = data[i:i+width]
+        hex_part = ' '.join('{:02x}'.format(b) for b in bytearray(chunk))
+        ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in bytearray(chunk))
+        lines.append('  {:08x}  {:48s}  |{}|'.format(i, hex_part, ascii_part))
+    return '\n'.join(lines)
+
+
+def format_rdn(rdn_tuple):
+    """
+    Convierte un RDN de formato ssl (tupla de tuplas) a string legible.
+    Ejemplo: ((('commonName', 'foo'),), (('organizationName', 'bar'),))
+      -> "CN=foo, O=bar"
+    """
+    if not rdn_tuple:
+        return '(no disponible)'
+    oid_map = {
+        'commonName': 'CN',
+        'organizationName': 'O',
+        'organizationalUnitName': 'OU',
+        'countryName': 'C',
+        'stateOrProvinceName': 'ST',
+        'localityName': 'L',
+        'emailAddress': 'emailAddress',
+        'domainComponent': 'DC',
+        'streetAddress': 'street',
+        'postalCode': 'postalCode',
+        'serialNumber': 'serialNumber',
+        'surname': 'SN',
+        'givenName': 'GN',
+        'title': 'title',
+        'description': 'description',
+        'userId': 'UID',
+        'businessCategory': 'businessCategory',
+        'jurisdictionCountryName': 'jurisdictionC',
+        'jurisdictionStateOrProvinceName': 'jurisdictionST',
+        'jurisdictionLocalityName': 'jurisdictionL',
+    }
+    parts = []
+    for rdn in rdn_tuple:
+        for attr in rdn:
+            key = attr[0]
+            value = attr[1]
+            short = oid_map.get(key, key)
+            parts.append('{}={}'.format(short, value))
+    return ', '.join(parts)
+
+
+def format_datetime(s):
+    """Formatea una fecha ASN.1 a formato legible."""
+    if not s:
+        return '(no disponible)'
+    try:
+        # Formato ASN.1 GENERALIZEDTIME: YYYYMMDDHHMMSSZ
+        if s.endswith('Z'):
+            s = s[:-1]
+        if len(s) >= 14:
+            dt = datetime.datetime.strptime(s[:14], '%Y%m%d%H%M%S')
+            return dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+    except (ValueError, Exception):
+        pass
+    return s
+
+
+def days_remaining(not_after_str):
+    """Calcula los dias restantes hasta la fecha de expiracion."""
+    if not not_after_str:
+        return None
+    try:
+        s = not_after_str
+        if s.endswith('Z'):
+            s = s[:-1]
+        if len(s) >= 14:
+            dt = datetime.datetime.strptime(s[:14], '%Y%m%d%H%M%S')
+            remaining = (dt - utcnow()).total_seconds() / 86400.0
+            return int(remaining)
+    except (ValueError, Exception):
+        pass
+    return None
+
+
+def extract_sans(cert):
+    """Extrae los Subject Alternative Names del certificado."""
+    sans = []
+    # subjectAltName: tuple of (type, value)
+    alt_name = cert.get('subjectAltName', ())
+    if alt_name:
+        for entry in alt_name:
+            # entry es (type, value) donde type es 'DNS', 'IP Address', etc.
+            if len(entry) == 2:
+                sans.append('{}: {}'.format(entry[0], entry[1]))
+            else:
+                sans.append(str(entry))
+    return sans
+
+
+def cert_fingerprint(der_data, algo='sha1'):
+    """Calcula la huella del certificado."""
+    if algo == 'sha1':
+        h = hashlib.sha1(der_data).hexdigest()
+    elif algo == 'sha256':
+        h = hashlib.sha256(der_data).hexdigest()
+    else:
+        return 'algoritmo desconocido'
+    # Formatear con dos puntos
+    return ':'.join(h[i:i+2].upper() for i in range(0, len(h), 2))
+
+
+# ---------------------------------------------------------------------------
+# Helpers de version Python
+# ---------------------------------------------------------------------------
+
+def utcnow():
+    """Devuelve datetime UTC compatible Py2/Py3 sin warnings."""
+    if PY3:
+        return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+    else:
+        return datetime.datetime.utcnow()
+
+
+def python_version_string():
+    """Devuelve una cadena con la version de Python."""
+    v = sys.version_info
+    return 'Python {}.{}.{}'.format(v.major, v.minor, v.micro)
+    """Devuelve una cadena con la version de Python."""
+    v = sys.version_info
+    return 'Python {}.{}.{}'.format(v.major, v.minor, v.micro)
+
+
+# ---------------------------------------------------------------------------
+# Generacion de certificado autofirmado
+# ---------------------------------------------------------------------------
+
+def generate_self_signed_cert(tmpdir):
+    """
+    Genera un certificado autofirmado y su clave privada usando openssl.
+    Devuelve (cert_path, key_path).
+    """
+    key_path = os.path.join(tmpdir, 'server.key')
+    cert_path = os.path.join(tmpdir, 'server.pem')
+
+    # Generar clave privada
+    subprocess.check_call(
+        ['openssl', 'genrsa', '-out', key_path, '2048'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    # Generar certificado autofirmado
+    subprocess.check_call(
+        [
+            'openssl', 'req', '-new', '-x509',
+            '-key', key_path,
+            '-out', cert_path,
+            '-days', '365',
+            '-subj', '/CN=TLS-Tester-Server/O=TLS-Tester/OU=Diagnostic',
+            '-nodes'
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+
+    return cert_path, key_path
+
+
+def check_openssl():
+    """Verifica que openssl esta disponible."""
+    try:
+        subprocess.check_call(
+            ['openssl', 'version'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        return True
+    except (subprocess.CalledProcessError, OSError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Configuracion SSL unificada Py2 / Py3
+# ---------------------------------------------------------------------------
+
+def wrap_socket_ssl(sock, cert_file, key_file, ca_cert_file, cert_reqs):
+    """
+    Envuelve un socket con SSL/TLS de forma compatible con Python 2 y 3.
+    En Python 3 usa SSLContext; en Python 2 usa ssl.wrap_socket().
+    """
+    if PY3:
+        # Python 3: usar SSLContext (API moderna)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert_file, keyfile=key_file)
+        if ca_cert_file:
+            context.load_verify_locations(ca_cert_file)
+        context.verify_mode = cert_reqs
+        # Permitir que el cliente envie certificado incluso si no es obligatorio
+        if cert_reqs == ssl.CERT_NONE:
+            context.verify_mode = ssl.CERT_OPTIONAL
+            # Nota: CERT_OPTIONAL pide certificado pero no falla si no lo presenta.
+            # Usamos esto en modo no-mtls para poder inspeccionar certificados
+            # opcionales. Pero en modo no-mtls real, no se pide nada.
+            # Volvemos a NONE si es explicitamente --no-mtls
+        return context.wrap_socket(sock, server_side=True)
+    else:
+        # Python 2.7: usar ssl.wrap_socket() (API legacy)
+        ssl_version = ssl.PROTOCOL_SSLv23
+        return ssl.wrap_socket(
+            sock,
+            server_side=True,
+            certfile=cert_file,
+            keyfile=key_file,
+            ca_certs=ca_cert_file,
+            cert_reqs=cert_reqs,
+            ssl_version=ssl_version,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Handler HTTP
+# ---------------------------------------------------------------------------
+
+class DiagnosticHandler(BaseHTTPServer.BaseHTTPRequestHandler):
+    """
+    Handler HTTP que recopila y muestra toda la informacion de diagnostico
+    sobre cada peticion entrante.
+    """
+
+    # Referencia al servidor padre para acceder a la configuracion
+    server_config = None
+
+    def log_message(self, format, *args):
+        """Redirigimos el log del handler a stderr."""
+        print('[{}] {}'.format(
+            datetime.datetime.now().strftime('%H:%M:%S'),
+            format % args
+        ), file=sys.stderr)
+
+    def collect_diagnostics(self):
+        """Recopila toda la informacion de diagnostico y la devuelve como dict."""
+        diag = {}
+        now = utcnow()
+
+        # ---- Bloque E: Informacion del servidor ----
+        diag['server'] = {
+            'timestamp': now.strftime('%Y-%m-%d %H:%M:%S UTC'),
+            'timestamp_iso': now.isoformat() + 'Z',
+            'hostname': socket.gethostname(),
+            'pid': os.getpid(),
+            'port': self.server.server_port,
+            'python_version': sys.version,
+            'python_short': '{}.{}.{}'.format(
+                sys.version_info.major,
+                sys.version_info.minor,
+                sys.version_info.micro,
+            ),
+            'openssl_version': ssl.OPENSSL_VERSION,
+        }
+        if self.server_config:
+            diag['server']['mtls_enabled'] = self.server_config.get('mtls', False)
+            diag['server']['mtls_mode'] = self.server_config.get('mtls_mode', 'none')
+            diag['server']['http_mode'] = self.server_config.get('http_mode', False)
+            diag['server']['self_signed_cert'] = self.server_config.get('self_signed', False)
+            if self.server_config.get('cert_file'):
+                diag['server']['server_cert_file'] = self.server_config['cert_file']
+            if self.server_config.get('ca_cert_file'):
+                diag['server']['ca_cert_file'] = self.server_config['ca_cert_file']
+
+        # ---- Bloque A: Informacion de conexion TLS ----
+        tls_info = {}
+        http_mode = self.server_config.get('http_mode', False) if self.server_config else False
+        if http_mode:
+            tls_info['note'] = 'Modo HTTP plano — sin cifrado TLS.'
+        else:
+            try:
+                if hasattr(self.request, 'cipher'):
+                    cipher = self.request.cipher()
+                    if cipher:
+                        tls_info['cipher_name'] = cipher[0]
+                        tls_info['tls_version'] = cipher[1]
+                        tls_info['secret_bits'] = cipher[2]
+            except Exception as e:
+                tls_info['cipher_error'] = str(e)
+        diag['tls'] = tls_info
+
+        # ---- Bloque B: Certificado del cliente ----
+        client_cert_info = {}
+        try:
+            peer_cert = self.request.getpeercert()
+            if peer_cert is not None and len(peer_cert) > 0:
+                client_cert_info['present'] = True
+
+                # Subject
+                client_cert_info['subject'] = format_rdn(peer_cert.get('subject'))
+                client_cert_info['subject_raw'] = peer_cert.get('subject')
+
+                # Issuer
+                client_cert_info['issuer'] = format_rdn(peer_cert.get('issuer'))
+                client_cert_info['issuer_raw'] = peer_cert.get('issuer')
+
+                # Numero de serie
+                client_cert_info['serial_number'] = peer_cert.get('serialNumber', '(no disponible)')
+
+                # Validez
+                not_before = peer_cert.get('notBefore', '')
+                not_after = peer_cert.get('notAfter', '')
+                client_cert_info['not_before'] = format_datetime(not_before)
+                client_cert_info['not_after'] = format_datetime(not_after)
+                client_cert_info['days_remaining'] = days_remaining(not_after)
+
+                # ¿Expirado?
+                remaining_days = days_remaining(not_after)
+                client_cert_info['expired'] = (
+                    remaining_days is not None and remaining_days < 0
+                )
+                # ¿Aun no valido?
+                remaining_not_before = None
+                if not_before:
+                    try:
+                        s_val = not_before
+                        if s_val.endswith('Z'):
+                            s_val = s_val[:-1]
+                        if len(s_val) >= 14:
+                            dt_nb = datetime.datetime.strptime(s_val[:14], '%Y%m%d%H%M%S')
+                            remaining_not_before = int(
+                                (dt_nb - utcnow()).total_seconds() / 86400.0
+                            )
+                    except (ValueError, Exception):
+                        pass
+                client_cert_info['not_yet_valid'] = (
+                    remaining_not_before is not None and remaining_not_before > 0
+                )
+
+                # SANs
+                client_cert_info['subject_alt_names'] = extract_sans(peer_cert)
+
+                # OCSP
+                client_cert_info['ocsp_responders'] = peer_cert.get('OCSP', [])
+
+                # caIssuers
+                client_cert_info['ca_issuers'] = peer_cert.get('caIssuers', [])
+
+                # crlDistributionPoints
+                client_cert_info['crl_distribution_points'] = peer_cert.get('crlDistributionPoints', [])
+
+                # Key usage / Extended key usage
+                client_cert_info['key_usage'] = peer_cert.get('keyUsage', '(no disponible)')
+                client_cert_info['extended_key_usage'] = peer_cert.get('extendedKeyUsage', '(no disponible)')
+
+                # Algoritmo de firma
+                client_cert_info['signature_algorithm'] = peer_cert.get('signatureAlgorithm', '(no disponible)')
+
+                # Tamano de clave publica (intentamos deducirlo)
+                client_cert_info['public_key_size_bits'] = peer_cert.get('publicKeySize', '(no disponible)')
+
+                # version
+                client_cert_info['version'] = peer_cert.get('version', '(no disponible)')
+
+                # Huellas (fingerprints) — desde DER binario
+                try:
+                    der_data = self.request.getpeercert(binary_form=True)
+                    if der_data:
+                        client_cert_info['fingerprint_sha1'] = cert_fingerprint(der_data, 'sha1')
+                        client_cert_info['fingerprint_sha256'] = cert_fingerprint(der_data, 'sha256')
+                        client_cert_info['der_size_bytes'] = len(der_data)
+                except Exception as e:
+                    client_cert_info['fingerprint_error'] = str(e)
+
+                # PEM (si esta habilitado)
+                if self.server_config and self.server_config.get('show_pem'):
+                    try:
+                        der_data_pem = self.request.getpeercert(binary_form=True)
+                        if der_data_pem:
+                            client_cert_info['pem'] = ssl.DER_cert_to_PEM_cert(der_data_pem)
+                    except Exception as e:
+                        client_cert_info['pem_error'] = str(e)
+
+            else:
+                client_cert_info['present'] = False
+                client_cert_info['note'] = (
+                    'No se presento certificado de cliente. '
+                    'Si MTLS esta activado, la conexion deberia haber sido rechazada '
+                    'por la capa SSL antes de llegar aqui.'
+                )
+        except Exception as e:
+            client_cert_info['present'] = False
+            if hasattr(self.request, 'getpeercert'):
+                client_cert_info['error'] = str(e)
+            else:
+                client_cert_info['note'] = 'Modo HTTP (sin TLS): no hay certificado de cliente disponible.'
+        diag['client_certificate'] = client_cert_info
+
+        # ---- Bloque C: Peticion HTTP ----
+        http_info = {}
+
+        # Metodo, path, version HTTP
+        http_info['method'] = self.command
+        http_info['path'] = self.path
+        http_info['request_version'] = self.request_version
+
+        # Parsear query string
+        parsed = urlparse.urlparse(self.path)
+        http_info['path_only'] = parsed.path
+        http_info['query_string'] = parsed.query
+        if parsed.query:
+            http_info['query_params'] = dict(urlparse.parse_qsl(parsed.query))
+        else:
+            http_info['query_params'] = {}
+
+        # Headers (convertir a dict simple, los nombres en lowercase para consistencia)
+        headers = {}
+        for key, value in self.headers.items():
+            headers[key.lower()] = value
+        http_info['headers'] = headers
+
+        # Client address
+        http_info['client_ip'] = self.client_address[0]
+        http_info['client_port'] = self.client_address[1]
+
+        # Body
+        content_length = int(headers.get('content-length', 0))
+        body = b''
+        if content_length > 0:
+            body = self.rfile.read(content_length)
+        http_info['body_size_bytes'] = len(body)
+        http_info['body_is_text'] = is_text(body)
+        if body:
+            if is_text(body):
+                try:
+                    http_info['body_text'] = to_str(body)
+                except Exception:
+                    http_info['body_text'] = repr(body)
+            else:
+                http_info['body_hexdump'] = hex_dump(body)
+                http_info['body_base64'] = b64encode(body)
+
+        # Content type
+        http_info['content_type'] = headers.get('content-type', '(no especificado)')
+        http_info['user_agent'] = headers.get('user-agent', '(no especificado)')
+
+        diag['http'] = http_info
+
+        # ---- Bloque D: Variables de entorno ----
+        env_info = {}
+        all_env = {}
+        relevant_env = {}
+
+        for key, value in sorted(os.environ.items()):
+            all_env[key] = value
+            # Marcar como relevante si coincide con los prefijos conocidos
+            for prefix in RELEVANT_ENV_PREFIXES:
+                if key.upper().startswith(prefix.upper()):
+                    relevant_env[key] = value
+                    break
+
+        env_info['all'] = all_env
+        env_info['relevant'] = relevant_env
+        env_info['total_count'] = len(all_env)
+        env_info['relevant_count'] = len(relevant_env)
+        diag['environment'] = env_info
+
+        return diag
+
+    def respond(self, diag):
+        """Envia una respuesta HTML con el resumen del diagnostico."""
+        html_str = self.build_html_response(diag)
+        body = to_bytes(html_str)
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def build_html_response(self, diag):
+        """Construye una pagina HTML con los datos de diagnostico."""
+
+        html = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>tls-tester</title>
+<style>
+  body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+         max-width: 1100px; margin: 0 auto; padding: 20px;
+         background: #f5f5f5; color: #333; }}
+  h1 {{ color: #1a5276; border-bottom: 3px solid #2980b9; padding-bottom: 10px; }}
+  h2 {{ color: #2471a3; margin-top: 30px; border-bottom: 1px solid #aed6f1; padding-bottom: 5px; }}
+  h3 {{ color: #2e86c1; }}
+  .badge {{ display: inline-block; padding: 3px 10px; border-radius: 4px;
+           font-size: 0.85em; font-weight: bold; }}
+  .badge-ok {{ background: #27ae60; color: white; }}
+  .badge-warn {{ background: #f39c12; color: white; }}
+  .badge-error {{ background: #e74c3c; color: white; }}
+  .badge-info {{ background: #2980b9; color: white; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 10px 0;
+          background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }}
+  th, td {{ text-align: left; padding: 8px 12px; border: 1px solid #ddd; }}
+  th {{ background: #2980b9; color: white; }}
+  tr:nth-child(even) {{ background: #f2f9ff; }}
+  .section-box {{ background: white; padding: 15px 20px; margin: 15px 0;
+                 border-radius: 6px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
+  pre {{ background: #2c3e50; color: #ecf0f1; padding: 15px;
+        border-radius: 4px; overflow-x: auto; font-size: 0.85em; line-height: 1.4; }}
+  .pem {{ background: #1e1e1e; color: #d4d4d4; }}
+  .env-relevant {{ background: #fef9e7; }}
+  .fingerprint {{ font-family: 'Courier New', monospace; font-size: 0.9em;
+                 letter-spacing: 1px; word-break: break-all; }}
+</style>
+</head>
+<body>
+<h1>tls-tester</h1>
+<p>Generado: {timestamp}</p>
+"""
+
+        ts = diag['server']['timestamp']
+        html = html.format(timestamp=ts)
+
+        # --- Info del servidor ---
+        srv = diag['server']
+        html += '<h2>Servidor</h2><div class="section-box"><table>'
+        html += _row('Hostname', srv.get('hostname'))
+        html += _row('PID', str(srv.get('pid')))
+        html += _row('Puerto', str(srv.get('port')))
+        html += _row('Python', '<code>{}</code>'.format(
+            srv.get('python_short', '')))
+        html += _row('OpenSSL', srv.get('openssl_version', ''))
+        html += _row('MTLS activado',
+            '<span class="badge badge-ok">SI</span>' if srv.get('mtls_enabled')
+            else '<span class="badge badge-warn">NO (solo HTTPS)</span>')
+        mtls_mode = srv.get('mtls_mode', 'none')
+        html += _row('Modo TLS', '<span class="badge badge-info">{}</span>'.format(mtls_mode))
+        if srv.get('self_signed_cert'):
+            html += _row('Certificado servidor',
+                '<span class="badge badge-warn">AUTOFIRMADO (generado al vuelo)</span>')
+        if srv.get('server_cert_file'):
+            html += _row('Cert. servidor', '<code>{}</code>'.format(srv['server_cert_file']))
+        if srv.get('ca_cert_file'):
+            html += _row('CA cert.', '<code>{}</code>'.format(srv['ca_cert_file']))
+        html += '</table></div>'
+
+        # --- TLS ---
+        tls = diag['tls']
+        html += '<h2>Conexion TLS</h2><div class="section-box"><table>'
+        html += _row('Cipher suite', tls.get('cipher_name', '(no disponible)'))
+        html += _row('Version TLS', '<span class="badge badge-info">{}</span>'.format(
+            tls.get('tls_version', '(no disponible)')))
+        html += _row('Bits de clave', str(tls.get('secret_bits', '')))
+        if tls.get('cipher_error'):
+            html += _row('Error', tls['cipher_error'])
+        html += '</table></div>'
+
+        # --- Certificado del cliente ---
+        cert = diag['client_certificate']
+        html += '<h2>Certificado del Cliente</h2><div class="section-box">'
+        if cert.get('present'):
+            html += '<p><span class="badge badge-ok">PRESENTE</span>'
+
+            # Alertas de validez
+            if cert.get('expired'):
+                html += ' <span class="badge badge-error">EXPIRADO</span>'
+            if cert.get('not_yet_valid'):
+                html += ' <span class="badge badge-warn">AUN NO VALIDO</span>'
+            if not cert.get('expired') and not cert.get('not_yet_valid'):
+                remaining = cert.get('days_remaining')
+                if remaining is not None:
+                    if remaining < 30:
+                        html += ' <span class="badge badge-warn">EXPIRA EN {} DIAS</span>'.format(remaining)
+                    else:
+                        html += ' <span class="badge badge-ok">VALIDO ({} dias)</span>'.format(remaining)
+            html += '</p>'
+
+            html += '<h3>Subject</h3><table>'
+            html += _row('DN completo', '<strong>{}</strong>'.format(cert.get('subject', '')))
+
+            # Desglose del subject
+            if cert.get('subject_raw'):
+                for rdn in cert['subject_raw']:
+                    for attr in rdn:
+                        html += _row('  ' + attr[0], attr[1])
+            html += '</table>'
+
+            html += '<h3>Issuer</h3><table>'
+            html += _row('DN completo', cert.get('issuer', ''))
+            if cert.get('issuer_raw'):
+                for rdn in cert['issuer_raw']:
+                    for attr in rdn:
+                        html += _row('  ' + attr[0], attr[1])
+            html += '</table>'
+
+            html += '<h3>Datos</h3><table>'
+            html += _row('Numero de serie', cert.get('serial_number', ''))
+            html += _row('Valido desde', cert.get('not_before', ''))
+            html += _row('Valido hasta', cert.get('not_after', ''))
+            html += _row('Dias restantes', str(cert.get('days_remaining', '')))
+            html += _row('Version', str(cert.get('version', '')))
+            html += _row('Algoritmo de firma', cert.get('signature_algorithm', ''))
+            html += _row('Tamano clave publica', str(cert.get('public_key_size_bits', '')) + ' bits')
+            html += '</table>'
+
+            sans = cert.get('subject_alt_names', [])
+            if sans:
+                html += '<h3>Subject Alternative Names</h3><table>'
+                for san in sans:
+                    html += _row('SAN', san)
+                html += '</table>'
+
+            html += '<h3>Extensiones</h3><table>'
+            html += _row('Key Usage', cert.get('key_usage', ''))
+            html += _row('Extended Key Usage', cert.get('extended_key_usage', ''))
+            ocsp = cert.get('ocsp_responders', [])
+            html += _row('OCSP Responders', ', '.join(ocsp) if ocsp else '(ninguno)')
+            ca_issuers = cert.get('ca_issuers', [])
+            html += _row('CA Issuers URL', ', '.join(ca_issuers) if ca_issuers else '(ninguno)')
+            crl = cert.get('crl_distribution_points', [])
+            html += _row('CRL Distribution', ', '.join(crl) if crl else '(ninguno)')
+            html += '</table>'
+
+            html += '<h3>Huellas (Fingerprints)</h3><table>'
+            sha1 = cert.get('fingerprint_sha1', '')
+            sha256 = cert.get('fingerprint_sha256', '')
+            html += _row('SHA1', '<span class="fingerprint">{}</span>'.format(sha1))
+            html += _row('SHA256', '<span class="fingerprint">{}</span>'.format(sha256))
+            html += _row('DER size', '{} bytes'.format(cert.get('der_size_bytes', '')))
+            html += '</table>'
+
+            pem = cert.get('pem', '')
+            if pem:
+                html += '<h3>Certificado en PEM</h3><pre class="pem">{}</pre>'.format(pem)
+
+        else:
+            html += '<p><span class="badge badge-warn">NO PRESENTE</span></p>'
+            html += '<p>{}</p>'.format(cert.get('note', ''))
+            if cert.get('error'):
+                html += '<p>Error: <code>{}</code></p>'.format(cert['error'])
+        html += '</div>'
+
+        # --- HTTP ---
+        http_inf = diag['http']
+        html += '<h2>Peticion HTTP</h2><div class="section-box">'
+        html += '<h3>Request Line</h3><table>'
+        method = http_inf.get('method', '')
+        html += _row('Metodo', '<span class="badge badge-info">{}</span>'.format(method))
+        html += _row('Path', '<code>{}</code>'.format(http_inf.get('path', '')))
+        html += _row('Version HTTP', http_inf.get('request_version', ''))
+        html += _row('Client IP', '{}:{}'.format(
+            http_inf.get('client_ip', ''), http_inf.get('client_port', '')))
+        html += _row('User-Agent', http_inf.get('user_agent', ''))
+        html += _row('Content-Type', http_inf.get('content_type', ''))
+        html += '</table>'
+
+        # Query params
+        qp = http_inf.get('query_params', {})
+        if qp:
+            html += '<h3>Query String</h3><table>'
+            for k, v in sorted(qp.items()):
+                html += _row(str(k), str(v))
+            html += '</table>'
+
+        # Headers
+        headers = http_inf.get('headers', {})
+        if headers:
+            html += '<h3>Cabeceras HTTP</h3><table>'
+            for key in sorted(headers.keys()):
+                html += _row(str(key), str(headers[key]))
+            html += '</table>'
+
+        # Body
+        body_size = http_inf.get('body_size_bytes', 0)
+        if body_size > 0:
+            html += '<h3>Body ({} bytes)</h3>'.format(body_size)
+            if http_inf.get('body_is_text'):
+                body_text = http_inf.get('body_text', '')
+                html += '<pre>{}</pre>'.format(body_text)
+            else:
+                hexd = http_inf.get('body_hexdump', '')
+                html += '<pre>{}</pre>'.format(hexd)
+        else:
+            html += '<p><em>Sin body</em></p>'
+
+        html += '</div>'
+
+        # --- Variables de entorno ---
+        env_info = diag['environment']
+        html += '<h2>Variables de Entorno</h2><div class="section-box">'
+        html += '<p>{} variables totales, {} relevantes para TLS/Java</p>'.format(
+            env_info.get('total_count', 0), env_info.get('relevant_count', 0))
+
+        # Relevantes primero
+        relevant = env_info.get('relevant', {})
+        if relevant:
+            html += '<h3>Relevantes para MTLS / Java</h3><table>'
+            for key in sorted(relevant.keys()):
+                html += '<tr class="env-relevant"><td><strong>{}</strong></td><td><code>{}</code></td></tr>'.format(
+                    str(key), str(relevant[key]))
+            html += '</table>'
+
+        # Todas
+        all_env = env_info.get('all', {})
+        if all_env:
+            html += '<h3>Todas las variables</h3><table>'
+            for key in sorted(all_env.keys()):
+                html += _row(str(key), '<code>{}</code>'.format(str(all_env[key])))
+            html += '</table>'
+
+        html += '</div>'
+
+        html += '<hr><p><em>tls-tester — Python {}.{}.{}</em></p>'.format(
+            sys.version_info.major, sys.version_info.minor, sys.version_info.micro)
+        html += '</body></html>'
+        return html
+
+    def do_GET(self):
+        """Maneja peticiones GET."""
+        self._handle_request()
+
+    def do_POST(self):
+        """Maneja peticiones POST."""
+        self._handle_request()
+
+    def do_PUT(self):
+        """Maneja peticiones PUT."""
+        self._handle_request()
+
+    def do_DELETE(self):
+        """Maneja peticiones DELETE."""
+        self._handle_request()
+
+    def do_HEAD(self):
+        """Maneja peticiones HEAD."""
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+
+    def do_OPTIONS(self):
+        """Maneja peticiones OPTIONS."""
+        self.send_response(200)
+        self.send_header('Allow', 'GET, POST, PUT, DELETE, HEAD, OPTIONS')
+        self.end_headers()
+
+    def _handle_request(self):
+        """Logica comun para todas las peticiones."""
+        diag = None
+        try:
+            diag = self.collect_diagnostics()
+            self.print_diagnostics(diag)
+            if self.server_config and self.server_config.get('output_dir'):
+                self.save_diagnostics_json(diag)
+            self.respond(diag)
+        except Exception as e:
+            # Si algo falla, intentamos responder con un error 500
+            try:
+                error_body = '<h1>Error 500</h1><p>{}</p>'.format(str(e))
+                if diag:
+                    self.print_diagnostics(diag)
+                print('\n  *** ERROR en _handle_request: {} ***\n'.format(e), file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                sys.stderr.flush()
+                self.send_response(500)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(error_body)))
+                self.end_headers()
+                self.wfile.write(to_bytes(error_body))
+            except Exception:
+                # Si incluso eso falla, cerramos sin mas
+                pass
+
+    def print_diagnostics(self, diag):
+        """Imprime el diagnostico a stdout."""
+        sep = '=' * 78
+        ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        print('\n' + sep)
+        print('  NUEVA PETICION — {}'.format(ts))
+        print(sep)
+
+        # --- Servidor ---
+        srv = diag['server']
+        print('\n  [SERVIDOR]')
+        print('  Hostname  : {}'.format(srv.get('hostname')))
+        print('  PID       : {}'.format(srv.get('pid')))
+        print('  Puerto    : {}'.format(srv.get('port')))
+        print('  Python    : {}'.format(srv.get('python_short', '')))
+        print('  OpenSSL   : {}'.format(srv.get('openssl_version')))
+        mtls = 'SI' if srv.get('mtls_enabled') else 'NO (solo HTTPS)'
+        print('  MTLS      : {}'.format(mtls))
+        print('  Modo      : {}'.format(srv.get('mtls_mode', 'none')))
+        if srv.get('self_signed_cert'):
+            print('  Cert Srv  : AUTOFIRMADO (generado al vuelo)')
+        if srv.get('server_cert_file'):
+            print('  Cert Srv  : {}'.format(srv['server_cert_file']))
+        if srv.get('ca_cert_file'):
+            print('  CA cert   : {}'.format(srv['ca_cert_file']))
+
+        # --- TLS ---
+        tls = diag['tls']
+        print('\n  [CONEXION TLS]')
+        print('  Cipher     : {}'.format(tls.get('cipher_name', '(no disponible)')))
+        print('  Version    : {}'.format(tls.get('tls_version', '(no disponible)')))
+        print('  Bits       : {}'.format(tls.get('secret_bits', '')))
+        if tls.get('cipher_error'):
+            print('  Error      : {}'.format(tls['cipher_error']))
+
+        # --- Cliente ---
+        cert = diag['client_certificate']
+        print('\n  [CERTIFICADO DEL CLIENTE]')
+        if cert.get('present'):
+            print('  Estado     : PRESENTE')
+            print('  Subject    : {}'.format(cert.get('subject', '')))
+
+            # Desglose subject
+            if cert.get('subject_raw'):
+                for rdn in cert['subject_raw']:
+                    for attr in rdn:
+                        print('             :   {} = {}'.format(attr[0], attr[1]))
+
+            print('  Issuer     : {}'.format(cert.get('issuer', '')))
+            print('  Serial     : {}'.format(cert.get('serial_number', '')))
+            print('  Not Before : {}'.format(cert.get('not_before', '')))
+            print('  Not After  : {}'.format(cert.get('not_after', '')))
+
+            remaining = cert.get('days_remaining')
+            if remaining is not None:
+                if remaining < 0:
+                    print('  *** EXPIRADO hace {} dias ***'.format(abs(remaining)))
+                elif remaining < 30:
+                    print('  *** ATENCION: expira en {} dias ***'.format(remaining))
+                else:
+                    print('  Dias rest. : {}'.format(remaining))
+
+            if cert.get('expired'):
+                print('  *** ALERTA: Certificado EXPIRADO ***')
+            if cert.get('not_yet_valid'):
+                print('  *** ALERTA: Certificado AUN NO VALIDO ***')
+
+            print('  Version    : {}'.format(cert.get('version', '')))
+            print('  Algoritmo  : {}'.format(cert.get('signature_algorithm', '')))
+            print('  Clave pub. : {} bits'.format(cert.get('public_key_size_bits', '')))
+
+            sans = cert.get('subject_alt_names', [])
+            if sans:
+                print('  SANs:')
+                for san in sans:
+                    print('    - {}'.format(san))
+
+            print('  Key Usage  : {}'.format(cert.get('key_usage', '')))
+            print('  ExtKeyUsage: {}'.format(cert.get('extended_key_usage', '')))
+
+            ocsp = cert.get('ocsp_responders', [])
+            if ocsp:
+                print('  OCSP       : {}'.format(', '.join(ocsp)))
+            ca_iss = cert.get('ca_issuers', [])
+            if ca_iss:
+                print('  CA Issuers : {}'.format(', '.join(ca_iss)))
+            crl = cert.get('crl_distribution_points', [])
+            if crl:
+                print('  CRL        : {}'.format(', '.join(crl)))
+
+            sha1 = cert.get('fingerprint_sha1', '')
+            sha256 = cert.get('fingerprint_sha256', '')
+            print('  SHA1       : {}'.format(sha1))
+            print('  SHA256     : {}'.format(sha256))
+            print('  DER size   : {} bytes'.format(cert.get('der_size_bytes', '')))
+
+            pem = cert.get('pem', '')
+            if pem:
+                print('\n  [PEM del certificado]')
+                print(pem)
+
+        else:
+            print('  Estado     : NO PRESENTE')
+            if cert.get('note'):
+                print('  Nota       : {}'.format(cert['note']))
+            if cert.get('error'):
+                print('  Error      : {}'.format(cert['error']))
+
+        # --- HTTP ---
+        http_inf = diag['http']
+        print('\n  [PETICION HTTP]')
+        print('  Metodo     : {}'.format(http_inf.get('method', '')))
+        print('  Path       : {}'.format(http_inf.get('path', '')))
+        print('  Version    : {}'.format(http_inf.get('request_version', '')))
+        print('  Cliente    : {}:{}'.format(
+            http_inf.get('client_ip', ''), http_inf.get('client_port', '')))
+        print('  User-Agent : {}'.format(http_inf.get('user_agent', '')))
+        print('  Content-Type: {}'.format(http_inf.get('content_type', '')))
+
+        qp = http_inf.get('query_params', {})
+        if qp:
+            print('\n  Query String:')
+            for k, v in sorted(qp.items()):
+                print('    {} = {}'.format(k, v))
+
+        headers = http_inf.get('headers', {})
+        print('\n  Cabeceras HTTP:')
+        for key in sorted(headers.keys()):
+            print('    {}: {}'.format(key, headers[key]))
+
+        body_size = http_inf.get('body_size_bytes', 0)
+        if body_size > 0:
+            print('\n  Body ({} bytes):'.format(body_size))
+            if http_inf.get('body_is_text'):
+                print(http_inf.get('body_text', ''))
+            else:
+                print(http_inf.get('body_hexdump', ''))
+        else:
+            print('\n  Body: (vacio)')
+
+        # --- Variables de entorno ---
+        env_info = diag['environment']
+        print('\n  [VARIABLES DE ENTORNO]')
+        print('  {} totales, {} relevantes para TLS/Java'.format(
+            env_info.get('total_count', 0), env_info.get('relevant_count', 0)))
+
+        relevant = env_info.get('relevant', {})
+        if relevant:
+            print('\n  --- Relevantes para MTLS / Java ---')
+            for key in sorted(relevant.keys()):
+                print('    {} = {}'.format(key, relevant[key]))
+
+        print('\n  --- Todas ---')
+        all_env = env_info.get('all', {})
+        for key in sorted(all_env.keys()):
+            print('    {} = {}'.format(key, all_env[key]))
+
+        print('\n' + sep)
+        sys.stdout.flush()
+
+    def save_diagnostics_json(self, diag):
+        """Guarda el diagnostico como JSON en el directorio de salida."""
+        output_dir = self.server_config.get('output_dir')
+        if not output_dir:
+            return
+        try:
+            # Contar peticiones existentes
+            existing = [f for f in os.listdir(output_dir) if f.startswith('request_') and f.endswith('.json')]
+            count = len(existing) + 1
+            filename = 'request_{:04d}.json'.format(count)
+            filepath = os.path.join(output_dir, filename)
+
+            # Serializar a JSON
+            serializable = self._make_json_safe(diag)
+            json_str = json.dumps(serializable, indent=2, sort_keys=True, ensure_ascii=False)
+            with open(filepath, 'w') as f:
+                f.write(to_str(json_str))
+            print('[{}] JSON guardado en {}'.format(
+                datetime.datetime.now().strftime('%H:%M:%S'), filepath), file=sys.stderr)
+        except Exception as e:
+            print('[{}] ERROR al guardar JSON: {}'.format(
+                datetime.datetime.now().strftime('%H:%M:%S'), e), file=sys.stderr)
+
+    @staticmethod
+    def _make_json_safe(obj):
+        """Convierte recursivamente un objeto a tipos serializables JSON."""
+        if isinstance(obj, dict):
+            return {str(k): DiagnosticHandler._make_json_safe(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [DiagnosticHandler._make_json_safe(item) for item in obj]
+        elif isinstance(obj, bytes):
+            return obj.decode('utf-8', errors='replace')
+        elif isinstance(obj, STRING_TYPES):
+            return to_str(obj)
+        elif isinstance(obj, INTEGER_TYPES):
+            return int(obj)
+        elif isinstance(obj, float):
+            return obj
+        elif isinstance(obj, bool):
+            return obj
+        elif obj is None:
+            return None
+        else:
+            return str(obj)
+
+
+def _row(key, value):
+    """Helper para generar filas de tabla HTML."""
+    return '<tr><td><strong>{}</strong></td><td>{}</td></tr>\n'.format(
+        str(key), str(value))
+
+
+# ---------------------------------------------------------------------------
+# Servidor con soporte SSL
+# ---------------------------------------------------------------------------
+
+class ThreadingMTLSServer(SocketServer.ThreadingMixIn, BaseHTTPServer.HTTPServer):
+    """Servidor HTTPS con soporte multihilo y MTLS."""
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, server_address, handler_class, ssl_config, use_ssl=True):
+        BaseHTTPServer.HTTPServer.__init__(self, server_address, handler_class)
+        self.ssl_config = ssl_config
+
+        if use_ssl:
+            # Envolver el socket con SSL (compatible Py2/Py3)
+            try:
+                self.socket = wrap_socket_ssl(
+                    self.socket,
+                    cert_file=ssl_config['cert_file'],
+                    key_file=ssl_config['key_file'],
+                    ca_cert_file=ssl_config.get('ca_cert_file'),
+                    cert_reqs=ssl_config.get('cert_reqs', ssl.CERT_NONE),
+                )
+            except ssl.SSLError as e:
+                print('ERROR SSL al configurar el socket: {}'.format(e), file=sys.stderr)
+                raise
+            except Exception as e:
+                print('ERROR al configurar SSL: {}'.format(e), file=sys.stderr)
+                raise
+        # else: socket sin SSL (HTTP plano)
+
+
+# ---------------------------------------------------------------------------
+# Punto de entrada
+# ---------------------------------------------------------------------------
+
+def get_socket_errno(exc):
+    """Extrae el errno de una excepcion de socket (compatible Py2/Py3)."""
+    if hasattr(exc, 'errno') and exc.errno is not None:
+        return exc.errno
+    # En Python 3, errno puede estar en args[0]
+    if hasattr(exc, 'args') and len(exc.args) > 0:
+        return exc.args[0]
+    return None
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='tls-tester — Servidor HTTPS/MTLS para diagnostico de conexiones TLS',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent('''\
+            Ejemplos:
+              %(prog)s --port 8443
+              %(prog)s --port 8443 --http
+              %(prog)s --port 8443 --no-mtls
+              %(prog)s --port 8443 --cert server.pem --key server.key --ca-cert ca.pem
+              %(prog)s --port 8443 --ca-cert ca.pem --output-dir ./logs
+              %(prog)s --port 443 --cert /etc/ssl/certs/server.pem --key /etc/ssl/private/server.key --ca-cert /etc/ssl/certs/ca.pem --show-pem
+        ''')
+    )
+
+    parser.add_argument('--port', '-p', type=int, default=8443,
+                        help='Puerto de escucha (default: 8443)')
+    parser.add_argument('--cert', '-c', type=str, default=None,
+                        help='Fichero del certificado del servidor en formato PEM')
+    parser.add_argument('--key', '-k', type=str, default=None,
+                        help='Fichero de la clave privada del servidor en formato PEM')
+    parser.add_argument('--ca-cert', '-a', type=str, default=None,
+                        help='Fichero CA para validar certificados de cliente (PEM). '
+                             'Si no se especifica y --no-mtls no esta activo, '
+                             'se genera un aviso.')
+    parser.add_argument('--no-mtls', action='store_true', default=False,
+                        help='Desactiva la validacion de certificado de cliente (solo HTTPS)')
+    parser.add_argument('--http', action='store_true', default=False,
+                        help='Usar HTTP simple sin TLS (util detras de proxies que terminan SSL)')
+    parser.add_argument('--output-dir', '-o', type=str, default=None,
+                        help='Directorio donde guardar los diagnosticos como JSON')
+    parser.add_argument('--show-pem', action='store_true', default=False,
+                        help='Mostrar el certificado del cliente en formato PEM en la salida')
+    parser.add_argument('--save-cert', type=str, default=None,
+                        help='Guardar el certificado autofirmado del servidor en el fichero indicado '
+                             '(util para instalarlo en el almacen de confianza del proxy/navegador)')
+
+    args = parser.parse_args()
+
+    # -----------------------------------------------------------------------
+    # Validar argumentos
+    # -----------------------------------------------------------------------
+
+    # Determinar si MTLS esta activo
+    mtls_enabled = not args.no_mtls
+    http_mode = args.http
+
+    # En modo HTTP no necesitamos certificados
+    cert_file = args.cert
+    key_file = args.key
+    ca_cert_file = args.ca_cert
+    self_signed = False
+    tmpdir = None
+
+    if not http_mode:
+        if not cert_file or not key_file:
+            # Generar certificado autofirmado
+            if check_openssl():
+                tmpdir = tempfile.mkdtemp(prefix='tls_tester_')
+                atexit.register(lambda d=tmpdir: shutil.rmtree(d, ignore_errors=True))
+                print('[+] Generando certificado autofirmado temporal...', file=sys.stderr)
+                try:
+                    cert_file, key_file = generate_self_signed_cert(tmpdir)
+                    self_signed = True
+                    print('[+] Certificado generado: {}'.format(cert_file), file=sys.stderr)
+                    print('[+] Clave generada:      {}'.format(key_file), file=sys.stderr)
+                except Exception as e:
+                    print('ERROR: No se pudo generar el certificado autofirmado: {}'.format(e),
+                          file=sys.stderr)
+                    print('Asegurese de que openssl esta instalado o use --cert y --key.',
+                          file=sys.stderr)
+                    sys.exit(1)
+            else:
+                print('ERROR: No se proporcionaron --cert/--key y openssl no esta disponible.',
+                      file=sys.stderr)
+                print('Instale openssl o proporcione los ficheros de certificado con --cert y --key.',
+                      file=sys.stderr)
+                sys.exit(1)
+        else:
+            # Verificar que los ficheros existen
+            for fpath, label in [(cert_file, 'Certificado'), (key_file, 'Clave privada')]:
+                if not os.path.isfile(fpath):
+                    print('ERROR: {} no encontrado: {}'.format(label, fpath), file=sys.stderr)
+                    sys.exit(1)
+
+        # Verificar CA cert si MTLS esta activo
+        if mtls_enabled and not ca_cert_file:
+            print('ADVERTENCIA: MTLS activado pero no se proporciono --ca-cert.', file=sys.stderr)
+            print('Las conexiones de clientes SIN certificado seran rechazadas por SSL.', file=sys.stderr)
+            print('Para aceptar cualquier certificado de cliente sin validar, use un CA "comodin"', file=sys.stderr)
+            print('o desactive MTLS con --no-mtls.', file=sys.stderr)
+            print('', file=sys.stderr)
+
+        if ca_cert_file and not os.path.isfile(ca_cert_file):
+            print('ERROR: CA cert no encontrado: {}'.format(ca_cert_file), file=sys.stderr)
+            sys.exit(1)
+
+    # Directorio de salida JSON
+    output_dir = args.output_dir
+    if output_dir:
+        if not os.path.isdir(output_dir):
+            try:
+                os.makedirs(output_dir)
+                print('[+] Directorio de salida creado: {}'.format(output_dir), file=sys.stderr)
+            except Exception as e:
+                print('ERROR: No se pudo crear el directorio de salida: {}'.format(e), file=sys.stderr)
+                sys.exit(1)
+        print('[+] Diagnosticos JSON en: {}'.format(output_dir), file=sys.stderr)
+
+    # -----------------------------------------------------------------------
+    # Configuracion SSL / HTTP
+    # -----------------------------------------------------------------------
+
+    if http_mode:
+        mtls_mode = 'HTTP plano (sin TLS)'
+        cert_reqs = ssl.CERT_NONE
+    elif mtls_enabled:
+        cert_reqs = ssl.CERT_REQUIRED
+        mtls_mode = 'mTLS (certificado de cliente REQUERIDO)'
+    else:
+        cert_reqs = ssl.CERT_NONE
+        mtls_mode = 'HTTPS (sin validar cliente)'
+
+    ssl_config = {
+        'cert_file': cert_file,
+        'key_file': key_file,
+        'ca_cert_file': ca_cert_file,
+        'cert_reqs': cert_reqs,
+        'mtls': mtls_enabled,
+        'mtls_mode': mtls_mode,
+        'self_signed': self_signed,
+        'show_pem': args.show_pem,
+        'output_dir': output_dir,
+        'http_mode': http_mode,
+    }
+
+    # -----------------------------------------------------------------------
+    # Guardar certificado autofirmado si se solicito
+    # -----------------------------------------------------------------------
+
+    saved_cert_path = None
+    if self_signed and args.save_cert:
+        try:
+            shutil.copy(cert_file, args.save_cert)
+            saved_cert_path = os.path.abspath(args.save_cert)
+            print('[+] Certificado autofirmado guardado en: {}'.format(saved_cert_path),
+                  file=sys.stderr)
+        except Exception as e:
+            print('ERROR: No se pudo guardar el certificado: {}'.format(e), file=sys.stderr)
+
+    # -----------------------------------------------------------------------
+    # Iniciar servidor
+    # -----------------------------------------------------------------------
+
+    server_address = ('0.0.0.0', args.port)
+
+    print('=' * 78, file=sys.stderr)
+    print('  tls-tester — TLS/MTLS Diagnostic Server', file=sys.stderr)
+    print('=' * 78, file=sys.stderr)
+    print('  Puerto      : {}'.format(args.port), file=sys.stderr)
+    print('  Modo        : {}'.format(mtls_mode), file=sys.stderr)
+    if not http_mode:
+        print('  MTLS        : {}'.format('ACTIVADO' if mtls_enabled else 'DESACTIVADO'), file=sys.stderr)
+        print('  Cert. serv  : {}'.format(cert_file), file=sys.stderr)
+        print('  Clave serv  : {}'.format(key_file), file=sys.stderr)
+        if ca_cert_file:
+            print('  CA cert     : {}'.format(ca_cert_file), file=sys.stderr)
+        else:
+            print('  CA cert     : (no especificado)', file=sys.stderr)
+        if self_signed:
+            print('', file=sys.stderr)
+            print('  *** ATENCION: Certificado AUTOFIRMADO ***', file=sys.stderr)
+            print('', file=sys.stderr)
+            print('  Si un proxy o navegador rechaza la conexion con', file=sys.stderr)
+            print('  SSL_ERROR_UNKNOWN_CA_ALERT, el certificado del servidor', file=sys.stderr)
+            print('  no es de confianza. Soluciones:', file=sys.stderr)
+            print('', file=sys.stderr)
+            print('  1. Usar --http si hay un proxy que termina TLS', file=sys.stderr)
+            print('  2. Usar --save-cert fichero.pem para exportar el', file=sys.stderr)
+            print('     certificado e instalarlo en el almacen de confianza', file=sys.stderr)
+            print('     del proxy/navegador:', file=sys.stderr)
+            if saved_cert_path:
+                print('       Certificado guardado en: {}'.format(saved_cert_path), file=sys.stderr)
+            else:
+                print('       Ejecuta con: --save-cert /ruta/donde/guardar.pem', file=sys.stderr)
+            print('       Luego instalalo con (Linux):', file=sys.stderr)
+            print('         sudo cp fichero.pem /usr/local/share/ca-certificates/tls-tester.crt', file=sys.stderr)
+            print('         sudo update-ca-certificates', file=sys.stderr)
+            print('  3. Usar --cert y --key con un certificado firmado por', file=sys.stderr)
+            print('     la CA corporativa (el mismo que usaba Apache)', file=sys.stderr)
+            print('', file=sys.stderr)
+    if output_dir:
+        print('  Salida JSON : {}'.format(output_dir), file=sys.stderr)
+    print('  Hostname    : {}'.format(socket.gethostname()), file=sys.stderr)
+    print('  PID         : {}'.format(os.getpid()), file=sys.stderr)
+    print('  Python      : {}'.format(python_version_string()), file=sys.stderr)
+    print('  OpenSSL     : {}'.format(ssl.OPENSSL_VERSION), file=sys.stderr)
+    print('', file=sys.stderr)
+    print('  URLs de prueba:', file=sys.stderr)
+    if http_mode:
+        print('    http://localhost:{}/'.format(args.port), file=sys.stderr)
+        print('    http://{}:{}/'.format(socket.gethostname(), args.port), file=sys.stderr)
+        print('    curl http://localhost:{}/'.format(args.port), file=sys.stderr)
+    else:
+        print('    https://localhost:{}/'.format(args.port), file=sys.stderr)
+        print('    https://{}:{}/'.format(socket.gethostname(), args.port), file=sys.stderr)
+        if mtls_enabled:
+            print('    curl -k --cert client.pem --key client.key https://localhost:{}/'.format(args.port), file=sys.stderr)
+        else:
+            print('    curl -k https://localhost:{}/'.format(args.port), file=sys.stderr)
+    print('', file=sys.stderr)
+    print('  Ctrl+C para detener', file=sys.stderr)
+    print('=' * 78, file=sys.stderr)
+    print('', file=sys.stderr)
+
+    # Pasar configuracion al handler
+    DiagnosticHandler.server_config = ssl_config
+
+    try:
+        if http_mode:
+            # Modo HTTP simple — sin SSL
+            server = ThreadingMTLSServer(
+                server_address, DiagnosticHandler, ssl_config,
+                use_ssl=False
+            )
+        else:
+            server = ThreadingMTLSServer(server_address, DiagnosticHandler, ssl_config)
+    except ssl.SSLError as e:
+        print('ERROR SSL: {}'.format(e), file=sys.stderr)
+        print('Verifique que los ficheros de certificado son validos.', file=sys.stderr)
+        sys.exit(1)
+    except socket.error as e:
+        errno = get_socket_errno(e)
+        if errno == 13:
+            print('ERROR: Permiso denegado al abrir el puerto {}.'.format(args.port), file=sys.stderr)
+            print('Use un puerto > 1024 o ejecute con privilegios de root.', file=sys.stderr)
+        elif errno == 48 or errno == 98:
+            print('ERROR: El puerto {} ya esta en uso.'.format(args.port), file=sys.stderr)
+            print('Use otro puerto con --port o detenga el proceso que lo ocupa.', file=sys.stderr)
+        else:
+            print('ERROR de socket ({}) : {}'.format(errno, e), file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('\n[+] Apagando servidor...', file=sys.stderr)
+        server.shutdown()
+        server.server_close()
+        print('[+] Servidor detenido.', file=sys.stderr)
+        sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()
